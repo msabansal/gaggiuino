@@ -1,4 +1,4 @@
-// #include <RBDdimmer.h>
+#include <RBDdimmer.h>
 #include <EEPROM.h>
 #include <trigger.h>
 #include <EasyNextionLibrary.h>
@@ -6,11 +6,12 @@
 
 
 // Define our pins
-#define thermoDO 4
-#define thermoCS 5
-#define thermoCLK 6
-//#define vibrPin 7 // PD7
-#define relayPin 8  // PB0
+#define thermoDO 12
+#define thermoCS 15
+#define thermoCLK 14
+#define relayPin 4  // PB0
+#define dimmerPin 16
+#define dimmerZC 5
 
 //RAM debug
 extern unsigned int __bss_end;
@@ -20,7 +21,12 @@ extern void *__brkval;
 
 //Init the thermocouple with the appropriate pins defined above with the prefix "thermo"
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+// EasyNextion object init
 EasyNex myNex(Serial);
+
+// RobotDYN Dimmer object init
+dimmerLamp dimmer(dimmerPin,dimmerZC); //initialase port for dimmer for MEGA, Leonardo, UNO, Arduino M0, Arduino Zero
+
 
 
 
@@ -31,7 +37,7 @@ byte offsetTemp = 0;
 uint16_t brewTimeDelayTemp = 0;
 byte brewTimeDelayDivider = 0;
 char waterTempPrint[6];
-unsigned long timer = 0, timer_lcd = 0;
+unsigned long timer = millis(), timer_lcd = millis();
 bool lcdValuesUpdated = false;
 
 // EEPROM  stuff - alo global cause used in multiple functions
@@ -39,24 +45,18 @@ int EEP_ADDR1 = 1, EEP_ADDR2 = 20, EEP_ADDR3 = 40, EEP_ADDR4 = 60;
 
 
 void setup() {
-  myNex.begin(115200);
-  //Registering a higher baud rate for quicker serial communication
-  // Serial.print(F("baud=115200"));
-  // Serial.write(0xff);
-  // Serial.write(0xff);
-  // Serial.write(0xff);
-  // Serial.end();
-  Serial.begin(115200);
+  myNex.begin(115200); //this has been set as an init baud parameter on the Nextion LCD
+  Serial.begin(115200); // switching our board to the new serial speed
+  dimmer.begin(TOGGLE_MODE, OFF); //dimmer initialisation: name.begin(MODE, STATE)
+
+  dimmer.toggleSettings(0, 100); //Name.toggleSettings(MIN, MAX);
+  dimmer.setState(ON); // state: dimmer1.setState(ON/OFF);
 
   // relay port init and set initial operating mode
-  // pinMode(vibrPin, INPUT);
   pinMode(relayPin, OUTPUT);
 
-  // Chip side  HIGH/LOW  specification
-  // PORTB |= _BV(PB0);
-  //  PORTB &= ~_BV(PB0); slow
-  // PORTB |= _BV(PB0); //relayPin HIGH
-  PORTB &= ~_BV(PB0);  // relayPin LOW
+  // Set relayPin mode to LOW at start
+  digitalWrite(relayPin, LOW);  // relayPin LOW
 
   // Will wait hereuntil full serial is established, this is done so the LCD fully initializes before passing the EEPROM values
   delay(500);
@@ -68,22 +68,22 @@ void setup() {
 
   // Making sure we're getting the right values and sending them to the display
   tmp1 = readIntFromEEPROM(EEP_ADDR1);
-  if ( !(tmp1<0)  && tmp1 != NAN) {  // some checks to make sur ewe're getting an acceptable value
+  if ( !(tmp1 < 0)  && tmp1 != NAN) { // some checks to make sur ewe're getting an acceptable value
     myNex.writeNum("page1.n0.val", tmp1);
   }
   tmp2 = readIntFromEEPROM(EEP_ADDR2);
-  if ( !(tmp2<0)  && tmp2 != NAN) {  // some checks to make sur ewe're getting an acceptable value
+  if ( !(tmp2 < 0)  && tmp2 != NAN) { // some checks to make sur ewe're getting an acceptable value
     myNex.writeNum("page1.n1.val", tmp2);
   }
   tmp3 = readIntFromEEPROM(EEP_ADDR3);
-  if ( !(tmp3<0)  && tmp3 != NAN) {  // some checks to make sur ewe're getting an acceptable value
+  if ( !(tmp3 < 0)  && tmp3 != NAN) { // some checks to make sur ewe're getting an acceptable value
     myNex.writeNum("page2.n0.val", tmp3);
   }
   tmp4 = readIntFromEEPROM(EEP_ADDR4);
-  if ( !(tmp4<0)  && tmp4 != NAN) {  // some checks to make sur ewe're getting an acceptable value
+  if ( !(tmp4 < 0)  && tmp4 != NAN) { // some checks to make sur ewe're getting an acceptable value
     myNex.writeNum("page2.n1.val", tmp4);
   }
-  myNex.writeNum("page0.n1.val", getFreeSram());
+  myNex.writeNum("page0.n1.val", 0);
 }
 
 
@@ -91,7 +91,7 @@ void setup() {
 void loop() {
   myNex.NextionListen();
   // Reading the temperature every 250ms between the loops
-  if ((millis() - timer) > 350UL){
+  if ((millis() - timer) > 350UL) {
     currentTempReadValue = thermocouple.readCelsius();
     if (currentTempReadValue == NAN || currentTempReadValue < 0) currentTempReadValue = thermocouple.readCelsius();  // Making sure we're getting a desired value
     timer += 350UL;
@@ -103,32 +103,32 @@ void loop() {
 //  ALL used functions declared bellow
 // The *precise* temp control logic
 void doCoffee() {
-  // Getting the latest LCD side set temp settings 
+  // Getting the latest LCD side set temp settings
   if (myNex.currentPageId != 0 && lcdValuesUpdated == false) {
     // Making sure the serial communication finishes sending all the values
     setPoint = myNex.readNumber("page1.n0.val");  // reading the setPoint value from the lcd
-    if (!(setPoint<0) && setPoint != NAN && setPoint > 85) {
+    if (!(setPoint < 0) && setPoint != NAN && setPoint > 85) {
       delay(0);
     } else {
       setPoint = myNex.readNumber("page1.n0.val");
     }
 
     offsetTemp = myNex.readNumber("page1.n1.val");  // reading the offset value from the lcd
-    if ( !(offsetTemp<0) && offsetTemp != NAN ) {
+    if ( !(offsetTemp < 0) && offsetTemp != NAN ) {
       delay(0);
     } else {
       offsetTemp = myNex.readNumber("page1.n1.val");
     }
 
     brewTimeDelayTemp = myNex.readNumber("page2.n0.val");  // reading the brew time delay used to apply heating in waves
-    if ( !(brewTimeDelayTemp<0) && brewTimeDelayTemp != NAN ) {
+    if ( !(brewTimeDelayTemp < 0) && brewTimeDelayTemp != NAN ) {
       delay(0);
     } else {
       brewTimeDelayTemp = myNex.readNumber("page2.n0.val");
     }
 
     brewTimeDelayDivider = myNex.readNumber("page2.n1.val");  // reading the delay divider
-    if ( !(brewTimeDelayDivider<0) && brewTimeDelayDivider != NAN ) {
+    if ( !(brewTimeDelayDivider < 0) && brewTimeDelayDivider != NAN ) {
       delay(0);
     } else {
       brewTimeDelayDivider = myNex.readNumber("page2.n1.val");
@@ -137,28 +137,28 @@ void doCoffee() {
   } else if ( myNex.currentPageId == 0 && lcdValuesUpdated == false) {
     // Making sure the serial communication finishes sending all the values
     setPoint = myNex.readNumber("page1.n0.val");  // reading the setPoint value from the lcd
-    if (!(setPoint<0) && setPoint != NAN && setPoint > 85) {
+    if (!(setPoint < 0) && setPoint != NAN && setPoint > 85) {
       delay(0);
     } else {
       setPoint = myNex.readNumber("page1.n0.val");
     }
 
     offsetTemp = myNex.readNumber("page1.n1.val");  // reading the offset value from the lcd
-    if ( !(offsetTemp<0) && offsetTemp != NAN ) {
+    if ( !(offsetTemp < 0) && offsetTemp != NAN ) {
       delay(0);
     } else {
       offsetTemp = myNex.readNumber("page1.n1.val");
     }
 
     brewTimeDelayTemp = myNex.readNumber("page2.n0.val");  // reading the brew time delay used to apply heating in waves
-    if ( !(brewTimeDelayTemp<0) && brewTimeDelayTemp != NAN ) {
+    if ( !(brewTimeDelayTemp < 0) && brewTimeDelayTemp != NAN ) {
       delay(0);
     } else {
       brewTimeDelayTemp = myNex.readNumber("page2.n0.val");
     }
 
     brewTimeDelayDivider = myNex.readNumber("page2.n1.val");  // reading the delay divider
-    if ( !(brewTimeDelayDivider<0) && brewTimeDelayDivider != NAN ) {
+    if ( !(brewTimeDelayDivider < 0) && brewTimeDelayDivider != NAN ) {
       delay(0);
     } else {
       brewTimeDelayDivider = myNex.readNumber("page2.n1.val");
@@ -176,28 +176,28 @@ void doCoffee() {
 
   // Applying the powerOutput variable as part of the relay switching logic
   if (currentTempReadValue < (float)setPoint - 10.00 && !(currentTempReadValue < 0.00) && currentTempReadValue != NAN) {
-    PORTB |= _BV(PB0);  // relayPIN -> HIGH
+    digitalWrite(relayPin, HIGH);  // relayPIN -> HIGH
   } else if (currentTempReadValue >= (float)setPoint - 10.00 && currentTempReadValue < (float)setPoint - 3.00) {
-    PORTB |= _BV(PB0);   // relayPIN -> HIGH
+    digitalWrite(relayPin, HIGH);   // relayPIN -> HIGH
     delay(powerOutput);  // delaying the relayPin state for <powerOutput> ammount of time
-    PORTB &= ~_BV(PB0);  // relayPIN -> LOW
+    digitalWrite(relayPin, LOW);  // relayPIN -> LOW
   } else if (currentTempReadValue >= (float)setPoint - 3.00 && currentTempReadValue <= float(setPoint - 1.00)) {
-    PORTB |= _BV(PB0);   // relayPIN -> HIGH
+    digitalWrite(relayPin, HIGH);   // relayPIN -> HIGH
     delay(powerOutput);  // delaying the relayPin state for <powerOutput> ammount of time
-    PORTB &= ~_BV(PB0);  // relayPIN -> LOW
+    digitalWrite(relayPin, LOW);  // relayPIN -> LOW
     delay(powerOutput);  // delaying the relayPin state for <powerOutput> ammount of time
   } else if (currentTempReadValue >= (float)setPoint - 1.00 && currentTempReadValue < (float)setPoint - 0.50) {
-    PORTB |= _BV(PB0);   // relayPIN -> HIGH
+    digitalWrite(relayPin, HIGH);   // relayPIN -> HIGH
     delay(powerOutput);  // delaying the relayPin state for <powerOutput> ammount of time
-    PORTB &= ~_BV(PB0);  // relayPIN -> LOW
+    digitalWrite(relayPin, LOW);  // relayPIN -> LOW
     delay(powerOutput);  // delaying the relayPin state for <powerOutput> ammount of time
   } else {
-    PORTB &= ~_BV(PB0);  // relayPIN -> LOW
+    digitalWrite(relayPin, LOW);  // relayPIN -> LOW
   }
 
   // Updating the LCD every 500ms
   if (myNex.currentPageId == 0) {
-    if ((millis() - timer_lcd) > 500UL){
+    if ((millis() - timer_lcd) > 500UL) {
       if (currentTempReadValue < 115.00 ) {
         if (powerOutput > brewTimeDelayTemp) {
           powerOutput = brewTimeDelayTemp;
@@ -209,7 +209,7 @@ void doCoffee() {
         myNex.writeNum("page0.n0.val", powerOutput);
       } else if (currentTempReadValue > 115.00 && !(currentTempReadValue < 0) && currentTempReadValue != NAN ) {
         static bool blink = true;
-        static unsigned long timer_s1 = 0, timer_s2 = 0;
+        static unsigned long timer_s1 = millis(), timer_s2 = millis();
         unsigned long currentMillis = millis();
         if (blink == true) {
           if (currentMillis >= timer_s1 + 1000UL) {
@@ -238,10 +238,10 @@ void doCoffee() {
       tmp1 = currentTempReadValue - (float)offsetTemp;
       dtostrf(tmp1, 6, 2, waterTempPrint);
       myNex.writeStr("page0.t0.txt", waterTempPrint);  // Printing the current water temp values to the display
-      myNex.writeNum("page0.n1.val", getFreeSram());
+      myNex.writeNum("page0.n1.val", 0);
       timer_lcd += 500UL;
     }
-  } 
+  }
 }
 
 // EEPROM WRITE
@@ -292,23 +292,4 @@ void trigger1() {
     delay(10);  //giving it a bit of time to finish the serial comm
   }
   lcdValuesUpdated = false;
-}
-
-
-// Vibrtion sensor
-// bool vibrSense() {
-//   bool vibration_detect = false;
-//   unsigned long vibration = pulseIn(vibrPin, HIGH);
-//   if (vibration > 2000) vibration_detect = true;
-//   return vibration_detect;
-// }
-
-uint16_t getFreeSram() {
-  uint8_t newVariable;
-  // heap is empty, use bss as start memory address
-  if ((uint16_t)__brkval == 0)
-    return (((uint16_t)&newVariable) - ((uint16_t)&__bss_end));
-  // use heap end as the start of the memory address
-  else
-    return (((uint16_t)&newVariable) - ((uint16_t)__brkval));
 }
