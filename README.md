@@ -2,7 +2,7 @@
 
 ## WIP ##
 
-**ESP8266 branch - *UNTESTED
+>ESP8266 branch - *UNTESTED
 
 Gaggiuino started as an idea to improve an already cappable coffee machine while keeping the machine looks and buttons functionality as close as possible to the original, an important part is that no internal cables/connectors were modified, all the connections were made by creating splitters using the purchased spade connectors.
 
