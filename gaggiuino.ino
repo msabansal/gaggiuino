@@ -3,6 +3,7 @@
 #include <EasyNextionLibrary.h>
 #include <max6675.h>
 #include <ACS712.h>
+#include <HX711.h>
 
 
 // Define our pins
@@ -15,8 +16,18 @@
 #define pressurePin A1 // pressure transducer data pin
 #define steamPin A7 // steam ctrl pin
 
+#define scaleClockPin 2
+#define scaleDataPin 3
+
+#define RIGHT_SCALE_CALIBRATION -552.06873000
+#define LEFT_SCALE_CALIBRATION -2163.1904
+
+#define RELAY_LOW_TRIGGER 1
+
 // Define some const values
 #define GET_KTYPE_READ_EVERY 350 // thermocouple data read interval not recommended to be changed to lower than 250 (ms)
+#define GET_SCALE_READ_EVERY 250 // scale read interval not recommended to be changed to lower than 250 (ms)
+#define SCALE_WAIT_TIME 100 // Wait time for scale to get ready
 // #define GET_RTD_READ_EVERY 350 // thermocouple data read interval not recommended to be changed to lower than 250 (ms)
 #define REFRESH_SCREEN_EVERY 350 // Screen refresh interval (ms)
 #define DIMMER_UPDATE_EVERY 850 // Defines how often the dimmer gets calculated a new value during a brew cycle (ms)
@@ -25,7 +36,8 @@
 #define DESCALE_PHASE3_EVERY 120000 // long pause for scale softening
 #define MAX_SETPOINT_VALUE 110 //Defines the max value of the setpoint
 #define PI_SOAK_FOR 3000 // sets the ammount of time the preinfusion soaking phase is going to last for (ms)
-#define POWER_DRAW_ZERO 42 // sets the zero bar acs power value
+#define POWER_VALUE_COUNT 8 // Number of readings to use to calculate power average
+#define POWER_DRAW_ZERO 50002 // sets the zero bar acs power value
 
 
 //Init the thermocouples with the appropriate pins defined above with the prefix "thermo"
@@ -37,9 +49,11 @@ MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 // EasyNextion object init
 EasyNex myNex(Serial);
 // Init the ACS712 hall sensor
-ACS712 sensor(ACS712_20A, brewSwitchPin);
+ACS712 sensor(ACS712_30A, brewSwitchPin);
 // RobotDYN Dimmer object init
 dimmerLamp dimmer(dimmerPin); //initialise the dimmer on the chosen port
+
+HX711 scale;
 
 
 //##################__Transducer_stuff__##################################
@@ -55,6 +69,12 @@ uint8_t BAR_TO_DIMMER_OUTPUT[10]; //={45,50,53,56,59,63,67,71,75,80};
 // Some vars are better global
 volatile float kProbeReadValue;
 unsigned long thermoTimer;
+
+volatile float scaleWeight = 0.0;
+volatile float scaleOffset = 0.0;
+unsigned long scaleTimer;
+uint16_t acsVal = 0;
+
 bool POWER_ON;
 bool  descaleCheckBox;
 bool  preinfusionState;
@@ -101,7 +121,6 @@ uint16_t  EEP_WARMUP = 200;
 uint16_t  EEP_HOME_ON_SHOT_FINISH = 205;
 uint16_t  EEP_GRAPH_BREW = 205;
 
-
 void setup() {
   
   Serial.begin(115200); // switching our board to the new serial speed
@@ -110,8 +129,8 @@ void setup() {
   pinMode(relayPin, OUTPUT);
   pinMode(brewSwitchPin, INPUT);
   // Chip side  HIGH/LOW  specification
-  PORTB &= ~_BV(PB0);  // relayPin LOW
-  
+  relayOff();
+
   // Will wait hereuntil full serial is established, this is done so the LCD fully initializes before passing the EEPROM values
   while (myNex.readNumber("safetyTempCheck") != 100 )
   {
@@ -271,10 +290,12 @@ void setup() {
     myNex.writeNum("warmupState", init_val);
     myNex.writeNum("morePower.bt0.val", init_val);
   }
-  
+
   // Dimmer initialisation
   dimmer.begin(NORMAL_MODE, ON); //dimmer initialisation: name.begin(MODE, STATE)
   dimmer.setPower(BAR_TO_DIMMER_OUTPUT[9]);
+
+  scale.begin(scaleDataPin, scaleClockPin);
   
   // Calibrating the hall current sensor
   sensor.calibrate();
@@ -300,6 +321,58 @@ void loop() {
 }
 
 //##############################################################################################################################
+//############################################___________RELAY_HANDLING________#################################################
+//##############################################################################################################################
+void relayOff() {
+  if (RELAY_LOW_TRIGGER) {
+    PORTB |= _BV(PB0);   // relayPin -> HIGH
+  } else {
+    PORTB &= ~_BV(PB0);  // relayPin LOW
+  }
+}
+
+void relayOn() {
+  if (RELAY_LOW_TRIGGER) {
+    PORTB &= ~_BV(PB0);  // relayPin LOW
+  } else {
+    PORTB |= _BV(PB0);   // relayPin -> HIGH
+  }
+}
+
+
+//##############################################################################################################################
+//############################################___________SCALE_HANDLING________#################################################
+//##############################################################################################################################
+float scaleGetUnits() {
+    scale.power_up();
+    if (!scale.wait_ready_retry(3, SCALE_WAIT_TIME / 3)) {
+      return 0;
+    }
+    scale.set_gain(32);
+    scale.set_scale(RIGHT_SCALE_CALIBRATION);
+    scale.read();
+    float left_value = scale.get_units(5);
+    scale.set_gain(128);
+    scale.set_scale(LEFT_SCALE_CALIBRATION);
+    scale.read();
+    float right_value = scale.get_units(5);
+    scale.power_down();
+    return left_value + right_value;
+}
+
+void scaleRead() {
+  if ((millis() - scaleTimer) > GET_SCALE_READ_EVERY){
+    scaleWeight = scaleGetUnits() - scaleOffset;
+    scaleTimer = millis();
+  }
+}
+
+void scaleTare() {
+  scaleOffset = scaleGetUnits();
+}
+
+
+//##############################################################################################################################
 //###########################################___________THERMOCOUPLE_READ________###############################################
 //##############################################################################################################################
 
@@ -309,7 +382,7 @@ void kThermoRead() { // Reading the thermocouple temperature
   if ((millis() - thermoTimer) > GET_KTYPE_READ_EVERY){
     kProbeReadValue = thermocouple.readCelsius();  // Making sure we're getting a value
     while (kProbeReadValue <= 0 || kProbeReadValue == NAN || kProbeReadValue > 170.0) {
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
       if ((millis() - thermoTimer) > GET_KTYPE_READ_EVERY){
         kProbeReadValue = thermocouple.readCelsius();  // Making sure we're getting a value
         thermoTimer = millis();
@@ -475,31 +548,31 @@ void justDoCoffee() {
     myNex.writeNum("warmupState", 0);
   // Applying the HPWR_OUT variable as part of the relay switching logic
     if (kProbeReadValue < setPoint+0.5) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT/BrewCycleDivider);  // delaying the relayPin state change
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
       delay(HPWR_OUT); 
     }
   } else if (brewState() == 0) {
     brewTimer(0);
     if (kProbeReadValue < ((float)setPoint - 10.00)) {
-      PORTB |= _BV(PB0);  // relayPin -> HIGH
+      relayOn();
     } else if (kProbeReadValue >= ((float)setPoint - 10.00) && kProbeReadValue < ((float)setPoint - 3.00)) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT);  // delaying the relayPin state for <HPWR_OUT> ammount of time
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
     } else if ((kProbeReadValue >= ((float)setPoint - 3.00)) && (kProbeReadValue <= ((float)setPoint - 1.00))) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT);  // delaying the relayPin state for <HPWR_OUT> ammount of time
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
       delay(HPWR_OUT);  // delaying the relayPin state for <HPWR_OUT> ammount of time
     } else if ((kProbeReadValue >= ((float)setPoint - 0.50)) && kProbeReadValue < (float)setPoint) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT/2);  // delaying the relayPin state for <HPWR_OUT> ammount of time
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
       delay(HPWR_OUT*2);  // delaying the relayPin state for <HPWR_OUT> ammount of time
     } else {
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
     }
   } 
 }
@@ -516,32 +589,32 @@ void heatCtrl() {
   if (brewState() == 1) {
   // Applying the HPWR_OUT variable as part of the relay switching logic
     if (kProbeReadValue < setPoint+0.5) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT/BrewCycleDivider);  // delaying the relayPin state change
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
       delay(HPWR_OUT); 
     }
     myNex.writeNum("warmupState", 0);
   } else if (brewState() == 0) {
     brewTimer(0);
     if (kProbeReadValue < ((float)setPoint - 10.00)) {
-      PORTB |= _BV(PB0);  // relayPin -> HIGH
+      relayOn();
     } else if (kProbeReadValue >= ((float)setPoint - 10.00) && kProbeReadValue < ((float)setPoint - 3.00)) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT);  // delaying the relayPin state for <HPWR_OUT> ammount of time
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
     } else if ((kProbeReadValue >= ((float)setPoint - 3.00)) && (kProbeReadValue <= ((float)setPoint - 1.00))) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT);  // delaying the relayPin state for <HPWR_OUT> ammount of time
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
       delay(HPWR_OUT);  // delaying the relayPin state for <HPWR_OUT> ammount of time
     } else if ((kProbeReadValue <= ((float)setPoint - 0.25)) && kProbeReadValue < (float)setPoint) {
-      PORTB |= _BV(PB0);   // relayPin -> HIGH
+      relayOn();
       delay(HPWR_OUT/2);  // delaying the relayPin state for <HPWR_OUT> ammount of time
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
       delay(HPWR_OUT*2);  // delaying the relayPin state for <HPWR_OUT> ammount of time
     } else {
-      PORTB &= ~_BV(PB0);  // relayPin -> LOW
+      relayOff();
     }
   }
 } 
@@ -556,9 +629,9 @@ void steamCtrl() {
   if (brewState() == 0 && analogRead(steamPin) == 0 ) {
     if (boilerPressure >=0.3 && boilerPressure <= 9.0) {
       if ((kProbeReadValue > setPoint-10.00) && (kProbeReadValue <=155)) {
-        PORTB |= _BV(PB0);  // relayPin -> HIGH
+        relayOn();
       } else {
-        PORTB &= ~_BV(PB0);  // relayPin -> LOW
+        relayOff();
       }
     }
   }
@@ -575,6 +648,7 @@ void lcdRefresh() {
     myNex.writeNum("currentHPWR", HPWR_OUT); 
     myNex.writeStr("pressureVal.txt", String(getPressure(),1));
     myNex.writeNum("currentTemp",int(kProbeReadValue-offsetTemp));    
+    myNex.writeNum("acsVal", acsVal);
     pageRefreshTimer = millis();
   }
 }
@@ -726,14 +800,21 @@ void trigger1() {
 //#############################################################################################
 //###############################_____HELPER_FUCTIONS____######################################
 //#############################################################################################
+uint16_t getPower() {
+  uint32_t P;
+  for (int i = 0; i < POWER_VALUE_COUNT; ++i) {
+    // Checking which region we're running in so the right formula can be applied
+    if (regionHz < 55 ) P = 240 * sensor.getCurrentAC();
+    else if (regionHz > 55 ) P = 120 * sensor.getCurrentAC(regionHz);
+  }
 
+  return (uint16_t) (P / POWER_VALUE_COUNT);
+}
 //Function to get the state of the brew switch button
 //returns true or false based on the read P(power) value
 bool brewState() {  //Monitors the current flowing through the ACS712 circuit and returns a value depending on the power value (P) the system draws
-  uint16_t P;
-  // Checking which region we're running in so the right formula can be applied
-  if (regionHz < 55 ) P = 240 * sensor.getCurrentAC();
-  else if (regionHz > 55 ) P = 120 * sensor.getCurrentAC(regionHz);
+  uint16_t P = getPower();
+  acsVal = P;
   // Returnig "true" or "false" as the function response
   if ( P >= POWER_DRAW_ZERO ) return 1;
   else return 0;
